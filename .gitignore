@@ -1,0 +1,24 @@
+# 编译输出
+*.o
+*.a
+*.so
+*.out
+build/
+lib/
+bin/
+
+# 日志文件
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 临时文件
+*.tmp
+*.bak
