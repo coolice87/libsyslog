@@ -19,6 +19,7 @@ typedef struct {
     int file_enabled;
     pthread_mutex_t mutex;
     int initialized;
+    int nonblocking_mode;  /* 新增：非阻塞模式标志 */
 } LibsyslogContext;
 
 static LibsyslogContext g_context = {0};
@@ -83,6 +84,7 @@ int libsyslog_init(const char *log_dir, const char *prefix, size_t max_file_size
     g_context.min_level = LIBSYSLOG_DEBUG;
     g_context.console_enabled = 1;
     g_context.file_enabled = 1;
+    g_context.nonblocking_mode = 1;  /* 默认启用非阻塞模式 */
     g_context.initialized = 1;
 
     return 0;
@@ -108,11 +110,21 @@ void libsyslog_cleanup(void)
     memset(&g_context, 0, sizeof(g_context));
 }
 
+/**
+ * 优化版本：最小化锁持有时间
+ * 策略：
+ * 1. 快速锁定，仅复制数据到本地缓冲区
+ * 2. 释放锁后再执行I/O操作（printf/文件写入）
+ * 3. 避免在锁内执行阻塞操作
+ */
 void libsyslog_log(int level, const char *format, ...)
 {
     va_list args;
     char *log_entry;
     size_t log_len;
+    char log_copy[LIBSYSLOG_LOG_ENTRY_SIZE];  /* 本地缓冲区副本 */
+    int need_flush = 0;
+    int should_print = 0;
 
     if (!g_context.initialized || level < g_context.min_level) {
         return;
@@ -123,33 +135,83 @@ void libsyslog_log(int level, const char *format, ...)
     va_end(args);
 
     log_len = strlen(log_entry);
-
-    pthread_mutex_lock(&g_context.mutex);
-
-    /* 控制台输出 */
-    if (g_context.console_enabled) {
-        printf("%s", log_entry);
-        fflush(stdout);
+    
+    /* 复制到本地缓冲区 */
+    if (log_len < LIBSYSLOG_LOG_ENTRY_SIZE) {
+        memcpy(log_copy, log_entry, log_len + 1);
+    } else {
+        return;
     }
 
-    /* 缓冲到内存 */
-    if (g_context.file_enabled) {
-        if (libsyslog_buffer_append(&g_context.buffer, log_entry, log_len) != 0) {
-            /* 缓冲区满，先刷新 */
-            libsyslog_flush();
-            /* 重新添加 */
-            libsyslog_buffer_append(&g_context.buffer, log_entry, log_len);
+    if (g_context.nonblocking_mode) {
+        /* ========== 非阻塞模式：快速路径 ========== */
+        
+        /* 第1阶段：锁定，快速操作 */
+        pthread_mutex_lock(&g_context.mutex);
+
+        /* 确定是否需要打印 */
+        should_print = g_context.console_enabled;
+
+        /* 缓冲到内存 */
+        if (g_context.file_enabled) {
+            if (libsyslog_buffer_append(&g_context.buffer, log_copy, log_len) != 0) {
+                /* 缓冲区满，标记需要刷新，但先释放锁 */
+                need_flush = 1;
+            }
+
+            /* 检查是否需要自动刷新 */
+            if (!need_flush && libsyslog_buffer_should_flush(&g_context.buffer,
+                                                    LIBSYSLOG_FLUSH_THRESHOLD_COUNT,
+                                                    LIBSYSLOG_FLUSH_THRESHOLD_TIME)) {
+                need_flush = 1;
+            }
         }
 
-        /* 检查是否需要自动刷新 */
-        if (libsyslog_buffer_should_flush(&g_context.buffer,
-                                         LIBSYSLOG_FLUSH_THRESHOLD_COUNT,
-                                         LIBSYSLOG_FLUSH_THRESHOLD_TIME)) {
+        pthread_mutex_unlock(&g_context.mutex);
+        
+        /* 第2阶段：释放锁后，执行I/O操作（不阻塞其他线程） */
+        
+        /* 控制台输出 - 现在不持有锁 */
+        if (should_print) {
+            printf("%s", log_copy);
+            fflush(stdout);
+        }
+
+        /* 文件刷新 - 现在不持有锁 */
+        if (need_flush) {
             libsyslog_flush();
         }
+        
+    } else {
+        /* ========== 兼容模式：原始设计 ========== */
+        
+        pthread_mutex_lock(&g_context.mutex);
+
+        /* 控制台输出 */
+        if (g_context.console_enabled) {
+            printf("%s", log_copy);
+            fflush(stdout);
+        }
+
+        /* 缓冲到内存 */
+        if (g_context.file_enabled) {
+            if (libsyslog_buffer_append(&g_context.buffer, log_copy, log_len) != 0) {
+                /* 缓冲区满，先刷新 */
+                libsyslog_flush();
+                /* 重新添加 */
+                libsyslog_buffer_append(&g_context.buffer, log_copy, log_len);
+            }
+
+            /* 检查是否需要自动刷新 */
+            if (libsyslog_buffer_should_flush(&g_context.buffer,
+                                             LIBSYSLOG_FLUSH_THRESHOLD_COUNT,
+                                             LIBSYSLOG_FLUSH_THRESHOLD_TIME)) {
+                libsyslog_flush();
+            }
+        }
+
+        pthread_mutex_unlock(&g_context.mutex);
     }
-
-    pthread_mutex_unlock(&g_context.mutex);
 }
 
 void libsyslog_set_level(int level)
@@ -193,6 +255,32 @@ void libsyslog_enable_file(int enable)
     pthread_mutex_lock(&g_context.mutex);
     g_context.file_enabled = enable ? 1 : 0;
     pthread_mutex_unlock(&g_context.mutex);
+}
+
+/**
+ * 设置非阻塞模式
+ * @param enable: 1启用非阻塞模式（默认），0使用兼容模式
+ * 
+ * 非阻塞模式：锁持有时间最短，I/O在锁外执行，推荐用于多线程场景
+ * 兼容模式：所有操作都在锁内执行，适合对顺序有严格要求的场景
+ */
+void libsyslog_set_nonblocking_mode(int enable)
+{
+    if (!g_context.initialized) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_context.mutex);
+    g_context.nonblocking_mode = enable ? 1 : 0;
+    pthread_mutex_unlock(&g_context.mutex);
+}
+
+int libsyslog_get_nonblocking_mode(void)
+{
+    if (!g_context.initialized) {
+        return -1;
+    }
+    return g_context.nonblocking_mode;
 }
 
 int libsyslog_flush(void)
